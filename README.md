@@ -1,5 +1,4 @@
 # Adaptive Fingerprint-Resistant MTD in SDN
-## Group 46 — First Semester Project
 
 ### Project Structure
 ```
