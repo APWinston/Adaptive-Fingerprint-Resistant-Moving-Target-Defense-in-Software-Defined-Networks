@@ -149,35 +149,51 @@ def chart_mutations(adaptive, baseline):
     print(f"[+] Saved: {path}")
 
 
-# ── Chart 3: Detectability Score Bar Chart ────────────────────────────────────
+# ── Chart 3: Measured Fingerprint Detectability (real classifier) ────────────
 def chart_detectability():
-    fig, ax = plt.subplots(figsize=(8, 5))
+    """
+    Plots the MEASURED classifier result.
 
-    categories = ['Baseline MTD\n(Simultaneous)', 'Adaptive MTD\n(Staggered)']
-    scores     = [1000.0, 1.6]
-    colors     = [BASELINE_COLOR, ADAPTIVE_COLOR]
+    An earlier version of this chart hardcoded scores of 1000.0 vs 1.6 and
+    annotated "Baseline is 613x more detectable". Those numbers came from a
+    simulation that invented its own timings, not from any experiment, and a
+    real Random Forest trained on captured traffic contradicted them.
+    The values below are the measured F1 scores.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
 
-    bars = ax.bar(categories, scores, color=colors, width=0.4,
-                  edgecolor='white', linewidth=1.5)
+    # (a) realistic attacker: all FLOW_MODs, no priority hint
+    bars = axes[0].bar(['Baseline\n(simultaneous)', 'Adaptive\n(staggered)'],
+                       [0.833, 0.741], color=[BASELINE_COLOR, ADAPTIVE_COLOR],
+                       width=0.45, edgecolor='white', linewidth=1.5)
+    for bar, v in zip(bars, [0.833, 0.741]):
+        axes[0].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.015,
+                     f'{v:.3f}', ha='center', fontsize=12, fontweight='bold')
+    style_ax(axes[0], "Realistic attacker\n(all FLOW_MODs, detecting installs)",
+             "", "Classifier F1  (lower = more resistant)")
+    axes[0].set_ylim(0, 1.0)
+    axes[0].text(0.5, 0.90, "staggering gives a modest reduction",
+                 transform=axes[0].transAxes, ha='center', fontsize=9,
+                 color='#555555', style='italic')
 
-    # Value labels on bars
-    for bar, score in zip(bars, scores):
-        ax.text(bar.get_x() + bar.get_width()/2,
-                bar.get_height() + 10,
-                f'{score}', ha='center', va='bottom',
-                fontsize=12, fontweight='bold')
+    # (b) pinpointing the trigger instant
+    bars = axes[1].bar(['Baseline\n(simultaneous)', 'Adaptive\n(staggered)'],
+                       [0.958, 0.000], color=[BASELINE_COLOR, ADAPTIVE_COLOR],
+                       width=0.45, edgecolor='white', linewidth=1.5)
+    for bar, v in zip(bars, [0.958, 0.000]):
+        axes[1].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.015,
+                     f'{v:.3f}', ha='center', fontsize=12, fontweight='bold')
+    style_ax(axes[1], "Pinpointing the mutation trigger\n(when the mutation fired)",
+             "", "Classifier F1  (lower = more resistant)")
+    axes[1].set_ylim(0, 1.0)
+    axes[1].text(0.5, 0.90, "attacker cannot locate the trigger at all",
+                 transform=axes[1].transAxes, ha='center', fontsize=9,
+                 color='#555555', style='italic')
 
-    style_ax(ax, "MTDSense Detectability Score\n(Lower = More Fingerprint Resistant)",
-             "", "Detectability Score")
-
-    ax.set_ylim(0, 1150)
-    ax.text(0.5, 0.92,
-            "Baseline is 613x more detectable than Adaptive",
-            transform=ax.transAxes, ha='center', fontsize=10,
-            color='#555555', style='italic')
-
+    plt.suptitle("Measured Fingerprint Detectability - Random Forest on captured traffic",
+                 fontsize=13, fontweight='bold', y=1.02)
     plt.tight_layout()
-    path = "results/graphs/03_detectability_score.png"
+    path = "results/graphs/03_detectability_measured.png"
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"[+] Saved: {path}")
@@ -187,14 +203,26 @@ def chart_detectability():
 def chart_installation_window():
     fig, ax = plt.subplots(figsize=(10, 5))
 
-    random.seed(42)
-    mutations = list(range(1, 11))
-
-    # Baseline: all at 0
-    baseline_windows = [0.0] * 10
-
-    # Adaptive: random windows between 0.5-3.0s
-    adaptive_windows = [random.uniform(0.5, 3.0) for _ in mutations]
+    # Read the MEASURED install windows from the trace rather than inventing
+    # them. Falls back to a clear message if the trace is unavailable.
+    per = {}
+    if os.path.exists("logs/install_trace.log"):
+        with open("logs/install_trace.log") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                per.setdefault(e["mutation_id"], []).append(float(e["install_ts"]))
+    adaptive_windows = [round(max(v) - min(v), 3) for v in per.values() if len(v) > 1]
+    if not adaptive_windows:
+        print("[!] No install trace found - skipping installation window chart.")
+        return
+    mutations = list(range(1, len(adaptive_windows) + 1))
+    baseline_windows = [0.0] * len(adaptive_windows)   # simultaneous by definition
 
     x = [m - 0.15 for m in mutations]
     y = [m + 0.15 for m in mutations]
@@ -212,7 +240,7 @@ def chart_installation_window():
     avg_adaptive = sum(adaptive_windows) / len(adaptive_windows)
     ax.axhline(avg_adaptive, color=ADAPTIVE_COLOR, linestyle=':',
                alpha=0.7, label=f'Adaptive avg ({avg_adaptive:.2f}s)')
-    ax.text(10.2, avg_adaptive, f'{avg_adaptive:.2f}s avg',
+    ax.text(len(mutations)+0.2, avg_adaptive, f'{avg_adaptive:.2f}s avg',
             color=ADAPTIVE_COLOR, fontsize=9, va='center')
 
     plt.tight_layout()

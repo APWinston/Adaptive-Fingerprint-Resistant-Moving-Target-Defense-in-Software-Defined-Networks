@@ -6,4 +6,5 @@ echo "[*] Clearing logs for fresh experiment run..."
 > logs/mutations.log
 > logs/triggers.log
 > logs/threat_scores.log
+> logs/install_trace.log
 echo "[*] Logs cleared. Ready for new run."
