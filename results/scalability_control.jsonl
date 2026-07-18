@@ -1,0 +1,2 @@
+null
+{"n_hosts": 8, "n_switches": 2, "n_pairs": 4, "flows_measured": 0, "aggregate_mbps": null, "per_node_mbps": null, "mean_flow_mbps": null, "install_window_s": 1.4716, "mutations_observed": 1, "installs_per_mut": 2.0, "expected_rules_per_mut": 16, "controller_cpu_pct": 0.0}

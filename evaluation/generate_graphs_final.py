@@ -10,7 +10,7 @@ import numpy as np
 import math
 from collections import Counter
 
-OUT = "/home/claude/report2/graphs"
+OUT = "results/graphs"
 BLUE   = "#1f77b4"
 ORANGE = "#ff7f0e"
 GREEN  = "#2ca02c"
