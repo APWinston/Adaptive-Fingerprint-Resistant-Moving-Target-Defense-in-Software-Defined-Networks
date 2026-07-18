@@ -163,16 +163,32 @@ class ThreatScoringEngine(app_manager.RyuApp):
         entry['last_seen'] = now
 
     def _check_threshold(self, src):
+        """
+        Fire when the score crosses the threshold.
+
+        detect_ts is stamped HERE, at the moment detection actually
+        happens, and threaded down to the mutation module. The proposal
+        defines Response Time = t_trigger - t_detection, but nothing was
+        ever recording t_detection, so the reported figure was really
+        t_install - t_trigger: the next segment of the path, not the one
+        specified. Passing the timestamp lets all three segments be
+        measured separately instead of conflated.
+
+        The third argument is positional; MTDTrigger.on_threat_detected
+        declares it with a default, so an older callback that takes only
+        two arguments is not broken by this.
+        """
         entry = self.threat_scores[src]
         if entry['score'] >= THREAT_THRESHOLD:
+            detect_ts = time.time()
             logger.warning("THREAT THRESHOLD REACHED for %s (score=%d) - signalling MTD",
                            src, entry['score'])
-            self._log_event(src, entry['score'])
+            self._log_event(src, entry['score'], detect_ts)
             entry['score'] = 0
             entry['ports'] = set()
             entry['arp_targets'] = set()
             if self.mutation_callback:
-                self.mutation_callback(src, THREAT_THRESHOLD)
+                self.mutation_callback(src, THREAT_THRESHOLD, detect_ts)
 
     # -- Utilities -------------------------------------------------------------
 
@@ -187,10 +203,14 @@ class ThreatScoringEngine(app_manager.RyuApp):
                 'window_start': time.time()
             }
 
-    def _log_event(self, src, score):
+    def _log_event(self, src, score, detect_ts=None):
+        # wall_ts is the high-resolution companion to timestamp. strftime
+        # only resolves to the second, which is useless for a measurement
+        # whose whole range is a couple of seconds.
         with open(LOG_FILE, 'a') as f:
             f.write(json.dumps({
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'wall_ts':   round(detect_ts if detect_ts else time.time(), 4),
                 'src_ip':    src,
                 'score':     score,
                 'event':     'MUTATION_TRIGGERED'

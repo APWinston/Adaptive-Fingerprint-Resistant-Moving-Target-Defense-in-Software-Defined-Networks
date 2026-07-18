@@ -1,50 +1,95 @@
 """
-KPI Calculator
-==============
-Computes the evaluation KPIs for the Adaptive Fingerprint-Resistant MTD
-project from the logs and the per-switch install trace.
+KPI Calculator (v2)
+===================
+Computes all five proposal KPIs from the RHM re-architecture runs.
 
-KPIs reported here:
-  1. Cooldown pass rate            -> mutations / threshold crossings
-  2. Scalability                   -> Throughput / Number of Nodes
-  3. Mutation Effectiveness        -> Shannon Entropy H(X)
-  4. Response Time                 -> mean(install_ts - trigger_ts)
-  5. Install window                -> measured spread of a staggered install
+WHAT CHANGED AND WHY
+--------------------
 
-FINGERPRINT RESISTANCE IS NOT COMPUTED HERE - AND THAT IS DELIBERATE
---------------------------------------------------------------------
-An earlier version of this script reported an Adjusted Rand Index (ARI) as
-a "fingerprint resistance" KPI. That metric compared the true mutation
-instants against a hand-written model of an attacker that only flagged
-perfectly synchronised installation bursts. A staggered system scores ~0
-under that model by construction, so the metric assumed its own conclusion.
-It produced ARI = 0.00 and an accompanying "613x more resistant" claim.
+1. ENTROPY IS NOW BINNED AT A FIXED WIDTH, AND READ FROM THE INSTALL TRACE.
 
-Empirical testing contradicted both. Training a real Random Forest on
-captured control-plane traffic, under an attacker that sees all FLOW_MOD
-messages with no priority hint, gave:
+   The old estimator set its bin width from each series' own range:
 
-    baseline  F1 = 0.833      adaptive  F1 = 0.741
+       width = (max - min) / 5
 
-- a modest reduction in detectability, not a 613-fold one. On the narrower
-task of pinpointing the mutation TRIGGER instant the gap is real and large
-(baseline F1 = 0.958, adaptive F1 = 0.000), but that is a narrower claim
-than "fingerprint resistant".
+   Baseline inter-mutation intervals are 30.004 .. 30.009s - five
+   MILLISECONDS of scheduler jitter. That range produced 1ms bins, the
+   jitter spread across all five of them, and a perfect metronome scored
+   1.906 bits: HIGHER than the adaptive system's 1.352. The KPI inverted
+   and would have destroyed the claim it was meant to support.
 
-Fingerprint resistance must therefore be measured with
-fingerprint_classifier.py against a real capture, not modelled here.
+   Two series binned at two different widths are not comparable. A fixed
+   width is applied to both, and reported alongside the result. At every
+   width from 1s to 15s the baseline scores exactly 0.000 - which is what
+   a fixed timer IS - and the adaptive system scores 0.9 to 2.4.
 
-Usage:
-  python evaluation/compute_kpis.py
-  python evaluation/compute_kpis.py --throughput 95.0 --nodes 5
+   The old code also derived mutation times from the experiment log, which
+   samples a CUMULATIVE COUNTER every 5s. Mutations that fired before
+   collection started all collapsed onto elapsed_s=0, inventing intervals
+   of 0s that the 5s cooldown makes impossible, and mutations after the
+   last sample vanished entirely. install_trace.log carries an exact
+   trigger_ts per mutation. That is the source of truth here.
+
+2. RDR IS MEASURED, NOT MODELLED.
+
+   The old rdr() computed mutations / threat_events - a cooldown pass
+   rate. It read 0.50 on a run with ~10 threshold crossings and 0.004 on a
+   run with ~2000: the defence did not change, the denominator did. Real
+   RDR now comes from evaluation/rdr_test.py, which counts probes to
+   addresses the attacker actually discovered.
+
+3. RESPONSE TIME IS REPORTED AS THREE SEGMENTS.
+
+   The proposal defines Response Time = t_trigger - t_detection. The code
+   measured install_ts - trigger_ts, which is the NEXT segment, and the
+   graph axis said "detection to install delay", which is the whole span.
+   Three different quantities were being treated as one number. All three
+   are now reported separately:
+
+       detection -> trigger   the proposal's formula
+       trigger   -> install   what was previously reported as 1.93s
+       detection -> install   end-to-end, what the graph plotted
+
+   Expect detection -> trigger to be near zero: the threat engine calls
+   the trigger inline, so there is no queue between them. That is a real
+   finding, not a bug - it means the end-to-end figure is dominated by the
+   deliberate stagger window, which is the interesting part.
+
+4. INSTALL SPREAD GROUPS ON (mode, mutation_id).
+
+   mutation_id restarts at 1 each run. Grouping on the id alone merges an
+   adaptive mutation #1 with a baseline mutation #1 whenever two runs land
+   in one trace file, turning a ~1s spread into the gap between two runs.
+
+USAGE
+-----
+  python3 evaluation/compute_kpis.py \
+      --adaptive-trace results/install_trace_rhm_adaptive.log \
+      --baseline-trace results/install_trace_rhm_baseline.log \
+      --rdr-adaptive   results/rdr_adaptive_*.json \
+      --rdr-baseline   results/rdr_baseline_*.json \
+      --scalability    results/scalability_*.jsonl \
+      --f1-install-adaptive 0.741 --f1-install-baseline 0.833 \
+      --f1-trigger-adaptive 0.000 --f1-trigger-baseline 0.958
+
+Every argument is optional; whatever is missing is reported as N/A rather
+than guessed.
 
 Group 46 - Adaptive Fingerprint-Resistant MTD in SDN
 """
 
-import json, os, glob, math, argparse
+import argparse
+import glob
+import json
+import math
+import os
 from collections import Counter
 
-# ------------------------------------------------------------------ helpers
+BIN_WIDTHS = [1, 2, 5, 10, 15]     # robustness sweep
+DEFAULT_BIN = 5.0
+
+
+# ------------------------------------------------------------------ loading
 def load_jsonl(path):
     out = []
     if not path or not os.path.exists(path):
@@ -60,167 +105,302 @@ def load_jsonl(path):
                 pass
     return out
 
-def latest(pattern):
+
+def resolve(pattern):
+    """Accept a literal path or a glob; return the newest match."""
+    if not pattern:
+        return None
+    if os.path.exists(pattern):
+        return pattern
     files = glob.glob(pattern)
     return max(files, key=os.path.getmtime) if files else None
 
-def mutation_times_from_experiment(records):
-    times, prev = [], 0
-    for r in records:
-        cur = r.get("mutations", 0)
-        if cur > prev:
-            for _ in range(cur - prev):
-                times.append(r.get("elapsed_s", 0))
-            prev = cur
-    return times
 
-def intervals_of(times):
-    return [round(times[i+1] - times[i], 3) for i in range(len(times) - 1)]
+# ------------------------------------------------------------------ trace parsing
+def trigger_times(trace):
+    """
+    One exact trigger timestamp per mutation.
 
-# ------------------------------------------------------------------ KPI 4: entropy
-def shannon_entropy(intervals, bins=5):
-    if len(intervals) < 2:
-        return None
-    lo, hi = min(intervals), max(intervals)
-    if hi == lo:
-        return 0.0
-    width = (hi - lo) / bins
-    counts = [0] * bins
-    for v in intervals:
-        counts[min(int((v - lo) / width), bins - 1)] += 1
-    n = len(intervals)
-    h = 0.0
-    for c in counts:
-        if c:
-            p = c / n
-            h -= p * math.log2(p)
-    return round(h, 3)
-
-# ------------------------------------------------------------------ KPI 5: response time
-def install_window_from_trace(trace):
-    """Measured spread between the first and last switch install per mutation."""
+    Every switch logs its own line for the same mutation, so the trace is
+    deduplicated on (mode, mutation_id) before the intervals are taken -
+    otherwise a 2-switch run would report each interval twice and a zero
+    between the pair.
+    """
     per = {}
     for e in trace:
-        per.setdefault(e["mutation_id"], []).append(float(e["install_ts"]))
-    windows = [max(v) - min(v) for v in per.values() if len(v) > 1]
-    if not windows:
-        return None, 0
-    return round(sum(windows) / len(windows), 3), len(windows)
+        key = (e.get("mode", "?"), e.get("mutation_id"))
+        if key not in per:
+            per[key] = float(e["trigger_ts"])
+    return sorted(per.values())
 
 
-def response_time_from_trace(trace):
-    """Mean install delay = install_ts - trigger_ts across all switch installs."""
-    deltas = [e["install_delay"] for e in trace if e.get("install_delay", -1) >= 0]
-    if not deltas:
-        return None, 0
-    return round(sum(deltas) / len(deltas), 3), len(deltas)
+def intervals_of(times):
+    return [times[i + 1] - times[i] for i in range(len(times) - 1)]
 
-# ------------------------------------------------------------------ cooldown ratio
-def cooldown_pass_rate(records):
+
+def install_spread(trace):
+    """Mean/min/max spread between first and last switch install per mutation."""
+    per = {}
+    for e in trace:
+        key = (e.get("mode", "?"), e.get("mutation_id"))
+        per.setdefault(key, []).append(float(e["install_ts"]))
+    spreads = [max(v) - min(v) for v in per.values() if len(v) > 1]
+    if not spreads:
+        return None, None, None, 0
+    return (round(sum(spreads) / len(spreads), 4),
+            round(min(spreads), 4), round(max(spreads), 4), len(spreads))
+
+
+def response_segments(trace):
     """
-    Fraction of threshold crossings that actually produced a mutation, i.e.
-    how many got past the cooldown. NOT a security metric.
+    The three segments of the response path.
 
-    This function used to be called rdr() and its output was reported as the
-    Reconnaissance Disruption Rate. It never measured that. It computes
-    mutations / threat_events, so its value is driven by how many times the
-    threshold was crossed - it read 0.50 on a run with ~10 crossings and
-    0.004 on a run with ~2000. The defence did not change; the denominator did.
-
-    True RDR for this system is ~0: the attacker scans REAL addresses, and the
-    mutation only rewrites traffic aimed at VIRTUAL addresses, so scans return
-    complete and accurate results (nmap reported every port on every run).
-    Measuring a real RDR requires an attack model in which the attacker only
-    ever learns virtual addresses, as in OF-RHM.
+    detect_ts is only present if the controller threaded it through (see
+    the threat_engine / mtd_trigger patches). Older traces simply report
+    N/A for the segments that need it rather than silently substituting
+    trigger_ts, which would make detection->trigger look like a measured
+    zero when it was never measured at all.
     """
-    if not records:
-        return None
-    last = records[-1]
-    threats   = last.get("threat_events", 0)
-    mutations = last.get("mutations", 0)
-    if threats <= 0:
-        return None
-    return round(mutations / threats, 4)
+    d2t, t2i, d2i = [], [], []
+    for e in trace:
+        trig = float(e["trigger_ts"])
+        inst = float(e["install_ts"])
+        t2i.append(inst - trig)
+        det = e.get("detect_ts")
+        if det is not None:
+            det = float(det)
+            d2t.append(trig - det)
+            d2i.append(inst - det)
+
+    def stat(vals):
+        if not vals:
+            return None, None, 0
+        return round(sum(vals) / len(vals), 4), round(max(vals), 4), len(vals)
+
+    return {
+        "detect_to_trigger":  stat(d2t),
+        "trigger_to_install": stat(t2i),
+        "detect_to_install":  stat(d2i),
+    }
 
 
-# ------------------------------------------------------------------ report
+# ------------------------------------------------------------------ entropy
+def shannon_entropy(intervals, width=DEFAULT_BIN):
+    """
+    H(X) over inter-mutation intervals, binned at a FIXED width.
+
+    The bin width is a methodological choice and must be identical for
+    every series being compared, and stated in the write-up. Deriving it
+    from each series' own range (the previous behaviour) silently
+    rescales the measurement per series and makes the numbers
+    incomparable.
+
+    abs() is applied because a single-bin distribution computes -0.0.
+    """
+    if len(intervals) < 2:
+        return None
+    counts = Counter(int(v // width) for v in intervals)
+    n = len(intervals)
+    h = -sum((c / n) * math.log2(c / n) for c in counts.values())
+    return round(abs(h), 3)
+
+
+def entropy_ceiling(intervals):
+    """
+    Maximum attainable H for this many samples: log2(n), reached only if
+    every interval lands in its own bin. Reported because adaptive and
+    baseline runs rarely have the same mutation count, so their ceilings
+    differ and the raw H values are not on quite the same scale.
+    """
+    n = len(intervals)
+    return round(math.log2(n), 3) if n > 1 else None
+
+
+# ------------------------------------------------------------------ RDR
+def read_rdr(path):
+    if not path or not os.path.exists(path):
+        return None
+    with open(path) as f:
+        d = json.load(f)
+    return {
+        "rdr":            d.get("rdr"),
+        "attempts":       d.get("attempts"),
+        "successes":      d.get("successes"),
+        "discovered":     len(d.get("discovered", [])),
+        "first_failure":  d.get("first_failure_s"),
+        "window":         d.get("window_s"),
+    }
+
+
+# ------------------------------------------------------------------ scalability
+def read_scalability(path):
+    rows = load_jsonl(path)
+    return sorted(rows, key=lambda r: r.get("n_hosts", 0))
+
+
+# ------------------------------------------------------------------ reporting
 def fmt(v, suffix=""):
-    return "N/A" if v is None else (f"{v}{suffix}")
+    return "N/A" if v is None else ("%s%s" % (v, suffix))
+
 
 def main():
-    ap = argparse.ArgumentParser(description="MTD KPI Calculator (Group 46)")
-    ap.add_argument("--adaptive", default=None)
-    ap.add_argument("--baseline", default=None)
-    ap.add_argument("--install-trace", default="logs/install_trace.log")
-    ap.add_argument("--throughput", type=float, default=None)
+    ap = argparse.ArgumentParser(description="MTD KPI calculator v2 (Group 46)")
+    ap.add_argument("--adaptive-trace", default="results/install_trace_rhm_adaptive.log")
+    ap.add_argument("--baseline-trace", default="results/install_trace_rhm_baseline.log")
+    ap.add_argument("--rdr-adaptive", default="results/rdr_adaptive_*.json")
+    ap.add_argument("--rdr-baseline", default="results/rdr_baseline_*.json")
+    ap.add_argument("--scalability", default="results/scalability_*.jsonl")
+    ap.add_argument("--bin-width", type=float, default=DEFAULT_BIN)
+    ap.add_argument("--f1-install-adaptive", type=float, default=None)
+    ap.add_argument("--f1-install-baseline", type=float, default=None)
+    ap.add_argument("--f1-trigger-adaptive", type=float, default=None)
+    ap.add_argument("--f1-trigger-baseline", type=float, default=None)
+    ap.add_argument("--throughput", type=float, default=None,
+                    help="single-topology aggregate Mbps, if not using the sweep")
     ap.add_argument("--nodes", type=int, default=None)
-    ap.add_argument("--scans", type=int, default=None)
     args = ap.parse_args()
 
-    adaptive_file = args.adaptive or latest("results/experiment_adaptive_*.jsonl")
-    baseline_file = args.baseline or latest("results/experiment_baseline_*.jsonl")
-    adaptive = load_jsonl(adaptive_file)
-    baseline = load_jsonl(baseline_file)
-    trace    = load_jsonl(args.install_trace)
+    a_path = resolve(args.adaptive_trace)
+    b_path = resolve(args.baseline_trace)
+    a_trace = load_jsonl(a_path)
+    b_trace = load_jsonl(b_path)
 
-    a_int = intervals_of(mutation_times_from_experiment(adaptive))
-    b_int = intervals_of(mutation_times_from_experiment(baseline))
+    a_times, b_times = trigger_times(a_trace), trigger_times(b_trace)
+    a_int,  b_int    = intervals_of(a_times), intervals_of(b_times)
 
-    a_entropy = shannon_entropy(a_int)
-    b_entropy = shannon_entropy(b_int)
-    a_cool = cooldown_pass_rate(adaptive)
-    b_cool = cooldown_pass_rate(baseline)
-    rt_mean, rt_n = response_time_from_trace(trace)
-    win_mean, win_n = install_window_from_trace(trace)
-    scal = (round(args.throughput / args.nodes, 3)
-            if args.throughput and args.nodes else None)
+    W = "=" * 72
+    print("\n" + W)
+    print("  MTD-SDN KPI REPORT v2  -  Group 46")
+    print(W)
+    print("  Adaptive trace : %s (%d installs, %d mutations)"
+          % (a_path or "not found", len(a_trace), len(a_times)))
+    print("  Baseline trace : %s (%d installs, %d mutations)"
+          % (b_path or "not found", len(b_trace), len(b_times)))
+    if a_times:
+        print("  Adaptive run span : %.1fs" % (a_times[-1] - a_times[0]))
+    if b_times:
+        print("  Baseline run span : %.1fs" % (b_times[-1] - b_times[0]))
+    print(W)
 
-    line = "=" * 64
-    print("\n" + line)
-    print("  MTD-SDN KPI REPORT  -  Group 46")
-    print(line)
-    print(f"  Adaptive data: {adaptive_file or 'not found'}")
-    print(f"  Baseline data: {baseline_file or 'not found'}")
-    print(f"  Install trace: {args.install_trace if trace else 'not found'} "
-          f"({len(trace)} install events)")
-    print(line)
+    # ---- KPI 1: Fingerprint resistance ---------------------------------
+    print("\n[1] FINGERPRINT RESISTANCE  (Random Forest F1; lower = better defence)")
+    print("-" * 72)
+    print("    %-34s%14s%14s" % ("attacker task", "baseline", "adaptive"))
+    print("    %-34s%14s%14s" % ("pinpointing trigger instant",
+                                 fmt(args.f1_trigger_baseline),
+                                 fmt(args.f1_trigger_adaptive)))
+    print("    %-34s%14s%14s" % ("detecting installs (all FLOW_MODs)",
+                                 fmt(args.f1_install_baseline),
+                                 fmt(args.f1_install_adaptive)))
+    print("    Supplied from fingerprint_classifier.py. The proposal's ARI is not")
+    print("    computed: it scored a hand-written attacker model rather than a real")
+    print("    one, and assumed its own conclusion.")
 
-    print(f"\n{'KPI':<34}{'Adaptive':>14}{'Baseline':>14}")
-    print("-" * 64)
-    print(f"{'1. Cooldown pass rate (not RDR)':<34}{fmt(a_cool):>14}{fmt(b_cool):>14}")
-    print(f"{'2. Scalability (Mbps/node)':<34}{fmt(scal):>14}{fmt(scal):>14}")
-    print(f"{'3. Mutation Entropy H(X) bits':<34}{fmt(a_entropy):>14}{fmt(b_entropy):>14}")
-    print(f"{'4. Response Time (s)':<34}{fmt(rt_mean):>14}{'n/a':>14}")
-    print(f"{'5. Install window (s, measured)':<34}{fmt(win_mean):>14}{'n/a':>14}")
-    print("-" * 64)
+    # ---- KPI 2: RDR -----------------------------------------------------
+    ra = read_rdr(resolve(args.rdr_adaptive))
+    rb = read_rdr(resolve(args.rdr_baseline))
+    print("\n[2] RECONNAISSANCE DISRUPTION RATE  (1 - successes/attempts)")
+    print("-" * 72)
+    if ra or rb:
+        print("    %-34s%14s%14s" % ("", "baseline", "adaptive"))
+        print("    %-34s%14s%14s" % ("RDR",
+                                     fmt(rb and rb["rdr"]), fmt(ra and ra["rdr"])))
+        print("    %-34s%14s%14s" % ("attempts",
+                                     fmt(rb and rb["attempts"]), fmt(ra and ra["attempts"])))
+        print("    %-34s%14s%14s" % ("successes",
+                                     fmt(rb and rb["successes"]), fmt(ra and ra["successes"])))
+        print("    %-34s%14s%14s" % ("addresses discovered",
+                                     fmt(rb and rb["discovered"]), fmt(ra and ra["discovered"])))
+        print("    %-34s%14s%14s" % ("knowledge stale after (s)",
+                                     fmt(rb and rb["first_failure"]), fmt(ra and ra["first_failure"])))
+        wa = ra and ra["window"]
+        wb = rb and rb["window"]
+        if wa and wb and wa != wb:
+            print("    !! WINDOWS DIFFER (%ss vs %ss). RDR grows with the observation" % (wb, wa))
+            print("       window, so these two numbers are NOT comparable. Re-run with")
+            print("       the same --window on both arms.")
+        print("    Both arms carry the identical real-IP shield, so any difference")
+        print("    here is a difference in mutation policy, not in reachability.")
+    else:
+        print("    N/A - run evaluation/rdr_test.py for both arms first.")
 
-    print("\nINTERPRETATION")
-    print("-" * 64)
-    if a_cool is not None:
-        print(f"  Cooldown pass rate = {a_cool} ({a_cool*100:.1f}% of threshold")
-        print("       crossings produced a mutation; the rest hit the cooldown).")
-        print("       This is NOT the Reconnaissance Disruption Rate.")
-    print("")
-    print("  RECONNAISSANCE DISRUPTION (RDR) = ~0 for this attack model.")
-    print("       The attacker scans real addresses; mutation only rewrites")
-    print("       traffic to virtual addresses, so scans succeed intact.")
-    print("       A real RDR needs an attacker that only learns virtual IPs.")
-    if a_entropy is not None and b_entropy is not None:
-        print(f"  Entropy: Adaptive={a_entropy} bits vs Baseline={b_entropy} bits.")
-    if rt_mean is not None:
-        print(f"  Response time = {rt_mean}s mean over {rt_n} switch installs.")
-    if win_mean is not None:
-        print(f"  Install window = {win_mean}s mean over {win_n} mutations.")
-        print("       (Baseline installs simultaneously, so its window is ~0.000s.)")
-    if scal is None:
-        print("  Scalability: run 'iperf h1 h3' in Mininet, then re-run with")
-        print("       --throughput <Mbps> --nodes <count>")
-    print("-" * 64)
-    print("  FINGERPRINT RESISTANCE is not reported here. Measure it with:")
-    print("     python fingerprint_classifier.py --pcap <capture> \\")
-    print("            --trace <install_trace> --label-installs --any-priority")
-    print("  Measured result: baseline F1 = 0.833, adaptive F1 = 0.741")
-    print(line + "\n")
+    # ---- KPI 3: Scalability ---------------------------------------------
+    rows = read_scalability(resolve(args.scalability))
+    print("\n[3] SCALABILITY  (aggregate throughput / nodes)")
+    print("-" * 72)
+    if rows:
+        print("    %-8s%-14s%-16s%-12s%-14s"
+              % ("N", "aggregate", "per-node", "CPU %", "install win"))
+        for r in rows:
+            print("    %-8s%-14s%-16s%-12s%-14s"
+                  % (r.get("n_hosts"), fmt(r.get("aggregate_mbps")),
+                     fmt(r.get("per_node_mbps")), fmt(r.get("controller_cpu_pct")),
+                     fmt(r.get("install_window_s"))))
+        print("    The KPI is the per-node column AS A TREND. A single N is a ratio,")
+        print("    not a scalability result.")
+    elif args.throughput and args.nodes:
+        print("    %.3f Mbps/node  (%.1f Mbps / %d nodes)"
+              % (args.throughput / args.nodes, args.throughput, args.nodes))
+        print("    Single point only - no trend. Run evaluation/scalability_test.py")
+        print("    to sweep N and get a curve.")
+    else:
+        print("    N/A - run evaluation/scalability_test.py.")
 
-if __name__ == "__main__":
+    # ---- KPI 4: Entropy -------------------------------------------------
+    print("\n[4] MUTATION EFFECTIVENESS  H(X) over inter-mutation intervals")
+    print("-" * 72)
+    a_h = shannon_entropy(a_int, args.bin_width) if a_int else None
+    b_h = shannon_entropy(b_int, args.bin_width) if b_int else None
+    print("    Bin width %.1fs (FIXED, identical for both series)" % args.bin_width)
+    print("    %-34s%14s%14s" % ("", "baseline", "adaptive"))
+    print("    %-34s%14s%14s" % ("H(X) bits", fmt(b_h), fmt(a_h)))
+    print("    %-34s%14s%14s" % ("ceiling log2(n)",
+                                 fmt(entropy_ceiling(b_int)), fmt(entropy_ceiling(a_int))))
+    print("    %-34s%14s%14s" % ("intervals (n)", len(b_int), len(a_int)))
+
+    if a_int and b_int:
+        print("\n    Robustness across bin widths:")
+        print("    %-14s%14s%14s" % ("width (s)", "baseline", "adaptive"))
+        for w in BIN_WIDTHS:
+            print("    %-14s%14s%14s"
+                  % (w, fmt(shannon_entropy(b_int, w)), fmt(shannon_entropy(a_int, w))))
+        print("    A conclusion that holds at every width is a property of the data.")
+        print("    One that only holds at a single width is a property of the binning.")
+
+    if a_int:
+        print("\n    Adaptive intervals: %s" % [round(v, 1) for v in a_int])
+    if b_int:
+        print("    Baseline intervals: %s" % [round(v, 3) for v in b_int])
+
+    # ---- KPI 5: Response time -------------------------------------------
+    print("\n[5] RESPONSE TIME")
+    print("-" * 72)
+    seg = response_segments(a_trace)
+    labels = [
+        ("detect_to_trigger",  "detection -> trigger   (proposal formula)"),
+        ("trigger_to_install", "trigger   -> install   (stagger window)"),
+        ("detect_to_install",  "detection -> install   (end-to-end)"),
+    ]
+    for key, label in labels:
+        mean, worst, n = seg[key]
+        print("    %-42s mean %s  max %s  (n=%s)"
+              % (label, fmt(mean, "s"), fmt(worst, "s"), n))
+    if seg["detect_to_trigger"][2] == 0:
+        print("    detection -> trigger is N/A: this trace has no detect_ts. Apply the")
+        print("    threat_engine.py / mtd_trigger.py patches and re-run to measure it.")
+
+    win, lo, hi, n = install_spread(a_trace)
+    print("\n    Install spread (adaptive): mean %s  range %s - %s  (n=%s)"
+          % (fmt(win, "s"), fmt(lo, "s"), fmt(hi, "s"), n))
+    bwin, blo, bhi, bn = install_spread(b_trace)
+    print("    Install spread (baseline): mean %s  range %s - %s  (n=%s)"
+          % (fmt(bwin, "s"), fmt(blo, "s"), fmt(bhi, "s"), bn))
+    print("    Baseline spread is MEASURED here, not asserted as 0. A simultaneous")
+    print("    install is not exactly instantaneous, and a measured sub-millisecond")
+    print("    figure is stronger evidence than a hardcoded zero.")
+
+    print("\n" + W)
+
+
+if __name__ == '__main__':
     main()

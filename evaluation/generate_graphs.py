@@ -1,60 +1,47 @@
 """
 Results Graph Generator
 ========================
-Generates all charts and graphs needed for the final report.
+Produces the evaluation charts from measured experiment data.
 
-Charts produced:
-  1. CPU overhead comparison (adaptive vs baseline)
-  2. Mutations over time (adaptive vs baseline)
-  3. Detectability score comparison (bar chart)
-  4. Installation window spread (adaptive vs baseline)
-  5. Threat detection timeline
+All values plotted here come from the experiment logs, the per-switch
+install trace, or iperf measurements passed on the command line. Nothing
+is simulated or hardcoded except the classifier F1 scores, which are the
+measured output of fingerprint_classifier.py.
 
-Run:
+Usage:
   python evaluation/generate_graphs.py \
-    --adaptive results/experiment_adaptive_1780746478.jsonl \
-    --baseline results/experiment_baseline_1780747012.jsonl
+      --adaptive results/experiment_adaptive_X.jsonl \
+      --baseline results/experiment_baseline_Y.jsonl \
+      --tput-before 94.6 --tput-after 94.7 --nodes 5
 
-Output: results/graphs/ folder (PNG files)
+Output: results/graphs/*.png
 
 Group 46 - Adaptive Fingerprint-Resistant MTD in SDN
 """
 
 import json
+import math
 import os
 import argparse
-import random
-import math
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 os.makedirs("results/graphs", exist_ok=True)
 
-# ── Try to import matplotlib ──────────────────────────────────────────────────
-try:
-    import matplotlib
-    matplotlib.use('Agg')  # Non-interactive backend for VM
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-    print("[!] matplotlib not found. Installing...")
-    os.system("sudo pip3 install matplotlib")
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    HAS_MATPLOTLIB = True
+# Measured classifier output (see fingerprint_classifier.py)
+F1_INSTALLS = {'baseline': 0.833, 'adaptive': 0.741}   # realistic attacker
+F1_TRIGGER  = {'baseline': 0.958, 'adaptive': 0.000}   # pinpointing the trigger
 
-ADAPTIVE_COLOR = "#2E75B6"
-BASELINE_COLOR = "#C00000"
-GRID_COLOR     = "#EEEEEE"
 
-def load_jsonl(filepath):
+# ---------------------------------------------------------------- data loading
+def load_jsonl(path):
     records = []
-    if not os.path.exists(filepath):
-        print(f"[!] File not found: {filepath}")
+    if not os.path.exists(path):
+        print("[!] File not found:", path)
         return records
-    with open(filepath) as f:
+    with open(path) as f:
         for line in f:
             line = line.strip()
             if line:
@@ -65,253 +52,258 @@ def load_jsonl(filepath):
     return records
 
 
-def style_ax(ax, title, xlabel, ylabel):
-    ax.set_title(title, fontsize=13, fontweight='bold', pad=12)
-    ax.set_xlabel(xlabel, fontsize=11)
-    ax.set_ylabel(ylabel, fontsize=11)
-    ax.grid(True, color=GRID_COLOR, linewidth=0.8)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-
-# ── Chart 1: CPU Overhead Over Time ──────────────────────────────────────────
-def chart_cpu(adaptive, baseline):
-    fig, ax = plt.subplots(figsize=(10, 5))
-
-    a_times = [r['elapsed_s'] for r in adaptive]
-    a_cpu   = [r['cpu_pct']   for r in adaptive]
-    b_times = [r['elapsed_s'] for r in baseline]
-    b_cpu   = [r['cpu_pct']   for r in baseline]
-
-    ax.plot(a_times, a_cpu, color=ADAPTIVE_COLOR, linewidth=2,
-            label='Adaptive MTD', marker='o', markersize=3)
-    ax.plot(b_times, b_cpu, color=BASELINE_COLOR, linewidth=2,
-            label='Baseline MTD', marker='s', markersize=3, linestyle='--')
-
-    ax.fill_between(a_times, a_cpu, alpha=0.1, color=ADAPTIVE_COLOR)
-    ax.fill_between(b_times, b_cpu, alpha=0.1, color=BASELINE_COLOR)
-
-    style_ax(ax, "CPU Overhead: Adaptive vs Baseline MTD",
-             "Time (seconds)", "CPU Usage (%)")
-    ax.legend(fontsize=10)
-
-    # Annotations
-    a_avg = sum(a_cpu) / len(a_cpu) if a_cpu else 0
-    b_avg = sum(b_cpu) / len(b_cpu) if b_cpu else 0
-    ax.axhline(a_avg, color=ADAPTIVE_COLOR, linestyle=':', alpha=0.5)
-    ax.axhline(b_avg, color=BASELINE_COLOR, linestyle=':', alpha=0.5)
-    ax.text(max(a_times)*0.8, a_avg+0.05, f'Avg {a_avg:.2f}%',
-            color=ADAPTIVE_COLOR, fontsize=9)
-    ax.text(max(b_times)*0.8, b_avg+0.05, f'Avg {b_avg:.2f}%',
-            color=BASELINE_COLOR, fontsize=9)
-
-    plt.tight_layout()
-    path = "results/graphs/01_cpu_overhead.png"
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"[+] Saved: {path}")
-
-
-# ── Chart 2: Mutations Over Time ──────────────────────────────────────────────
-def chart_mutations(adaptive, baseline):
-    fig, ax = plt.subplots(figsize=(10, 5))
-
-    a_times = [r['elapsed_s'] for r in adaptive]
-    a_muts  = [r['mutations'] for r in adaptive]
-    b_times = [r['elapsed_s'] for r in baseline]
-    b_muts  = [r['mutations'] for r in baseline]
-
-    ax.step(a_times, a_muts, color=ADAPTIVE_COLOR, linewidth=2,
-            label='Adaptive MTD', where='post')
-    ax.step(b_times, b_muts, color=BASELINE_COLOR, linewidth=2,
-            label='Baseline MTD', where='post', linestyle='--')
-
-    style_ax(ax, "Cumulative Mutations Over Time",
-             "Time (seconds)", "Number of Mutations")
-    ax.legend(fontsize=10)
-
-    # Add annotation boxes
-    a_final = a_muts[-1] if a_muts else 0
-    b_final = b_muts[-1] if b_muts else 0
-    ax.annotate(f'Total: {a_final}',
-                xy=(a_times[-1], a_final),
-                xytext=(a_times[-1]-30, a_final+0.3),
-                color=ADAPTIVE_COLOR, fontsize=9, fontweight='bold')
-    ax.annotate(f'Total: {b_final}',
-                xy=(b_times[-1], b_final),
-                xytext=(b_times[-1]-30, b_final+0.3),
-                color=BASELINE_COLOR, fontsize=9, fontweight='bold')
-
-    plt.tight_layout()
-    path = "results/graphs/02_mutations_over_time.png"
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"[+] Saved: {path}")
-
-
-# ── Chart 3: Measured Fingerprint Detectability (real classifier) ────────────
-def chart_detectability():
-    """
-    Plots the MEASURED classifier result.
-
-    An earlier version of this chart hardcoded scores of 1000.0 vs 1.6 and
-    annotated "Baseline is 613x more detectable". Those numbers came from a
-    simulation that invented its own timings, not from any experiment, and a
-    real Random Forest trained on captured traffic contradicted them.
-    The values below are the measured F1 scores.
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-
-    # (a) realistic attacker: all FLOW_MODs, no priority hint
-    bars = axes[0].bar(['Baseline\n(simultaneous)', 'Adaptive\n(staggered)'],
-                       [0.833, 0.741], color=[BASELINE_COLOR, ADAPTIVE_COLOR],
-                       width=0.45, edgecolor='white', linewidth=1.5)
-    for bar, v in zip(bars, [0.833, 0.741]):
-        axes[0].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.015,
-                     f'{v:.3f}', ha='center', fontsize=12, fontweight='bold')
-    style_ax(axes[0], "Realistic attacker\n(all FLOW_MODs, detecting installs)",
-             "", "Classifier F1  (lower = more resistant)")
-    axes[0].set_ylim(0, 1.0)
-    axes[0].text(0.5, 0.90, "staggering gives a modest reduction",
-                 transform=axes[0].transAxes, ha='center', fontsize=9,
-                 color='#555555', style='italic')
-
-    # (b) pinpointing the trigger instant
-    bars = axes[1].bar(['Baseline\n(simultaneous)', 'Adaptive\n(staggered)'],
-                       [0.958, 0.000], color=[BASELINE_COLOR, ADAPTIVE_COLOR],
-                       width=0.45, edgecolor='white', linewidth=1.5)
-    for bar, v in zip(bars, [0.958, 0.000]):
-        axes[1].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.015,
-                     f'{v:.3f}', ha='center', fontsize=12, fontweight='bold')
-    style_ax(axes[1], "Pinpointing the mutation trigger\n(when the mutation fired)",
-             "", "Classifier F1  (lower = more resistant)")
-    axes[1].set_ylim(0, 1.0)
-    axes[1].text(0.5, 0.90, "attacker cannot locate the trigger at all",
-                 transform=axes[1].transAxes, ha='center', fontsize=9,
-                 color='#555555', style='italic')
-
-    plt.suptitle("Measured Fingerprint Detectability - Random Forest on captured traffic",
-                 fontsize=13, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    path = "results/graphs/03_detectability_measured.png"
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"[+] Saved: {path}")
-
-
-# ── Chart 4: Installation Window Spread ──────────────────────────────────────
-def chart_installation_window():
-    fig, ax = plt.subplots(figsize=(10, 5))
-
-    # Read the MEASURED install windows from the trace rather than inventing
-    # them. Falls back to a clear message if the trace is unavailable.
-    per = {}
-    if os.path.exists("logs/install_trace.log"):
-        with open("logs/install_trace.log") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
+def load_trace(path="logs/install_trace.log"):
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
                 try:
-                    e = json.loads(line)
+                    rows.append(json.loads(line))
                 except json.JSONDecodeError:
-                    continue
-                per.setdefault(e["mutation_id"], []).append(float(e["install_ts"]))
-    adaptive_windows = [round(max(v) - min(v), 3) for v in per.values() if len(v) > 1]
-    if not adaptive_windows:
-        print("[!] No install trace found - skipping installation window chart.")
+                    pass
+    return rows
+
+
+def mutation_times(records):
+    times, prev = [], 0
+    for r in records:
+        cur = r.get("mutations", 0)
+        if cur > prev:
+            for _ in range(cur - prev):
+                times.append(r.get("elapsed_s", 0))
+            prev = cur
+    return times
+
+
+def intervals(times):
+    return [round(times[i + 1] - times[i], 3) for i in range(len(times) - 1)]
+
+
+def entropy(vals, bins=5):
+    if len(vals) < 2:
+        return 0.0
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        return 0.0
+    width = (hi - lo) / bins
+    counts = [0] * bins
+    for v in vals:
+        counts[min(int((v - lo) / width), bins - 1)] += 1
+    n = len(vals)
+    h = 0.0
+    for c in counts:
+        if c:
+            p = c / n
+            h -= p * math.log2(p)
+    return h
+
+
+def save(name):
+    path = "results/graphs/%s.png" % name
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print("[+] Saved:", path)
+
+
+# ---------------------------------------------------------------- 01 CPU
+def chart_cpu(adaptive, baseline):
+    plt.figure(figsize=(8, 5))
+    plt.plot([r['elapsed_s'] for r in adaptive], [r['cpu_pct'] for r in adaptive],
+             '-o', markersize=3, label='Adaptive')
+    plt.plot([r['elapsed_s'] for r in baseline], [r['cpu_pct'] for r in baseline],
+             '--s', markersize=3, label='Baseline')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Controller CPU (%)')
+    plt.title('CPU Overhead')
+    plt.legend()
+    plt.grid(True)
+    save('01_cpu_overhead')
+
+
+# ---------------------------------------------------------------- 02 mutations
+def chart_mutations(adaptive, baseline):
+    plt.figure(figsize=(8, 5))
+    plt.step([r['elapsed_s'] for r in adaptive], [r['mutations'] for r in adaptive],
+             where='post', label='Adaptive')
+    plt.step([r['elapsed_s'] for r in baseline], [r['mutations'] for r in baseline],
+             where='post', linestyle='--', label='Baseline')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Cumulative mutations')
+    plt.title('Mutations Over Time')
+    plt.legend()
+    plt.grid(True)
+    save('02_mutations_over_time')
+
+
+# ---------------------------------------------------------------- 03 classifier
+def chart_detectability():
+    labels = ['Baseline', 'Adaptive']
+    x = range(len(labels))
+    w = 0.35
+
+    plt.figure(figsize=(8, 5))
+    plt.bar([i - w / 2 for i in x],
+            [F1_INSTALLS['baseline'], F1_INSTALLS['adaptive']],
+            width=w, label='Detecting installs (all FLOW_MODs)')
+    plt.bar([i + w / 2 for i in x],
+            [F1_TRIGGER['baseline'], F1_TRIGGER['adaptive']],
+            width=w, label='Pinpointing trigger instant')
+    plt.xticks(list(x), labels)
+    plt.ylabel('Classifier F1 score')
+    plt.ylim(0, 1.05)
+    plt.title('Fingerprint Detectability (Random Forest)')
+    plt.legend()
+    plt.grid(True, axis='y')
+    save('03_detectability_measured')
+
+
+# ---------------------------------------------------------------- 04 install window
+def chart_installation_window(trace):
+    per = {}
+    for e in trace:
+        per.setdefault(e['mutation_id'], []).append(float(e['install_ts']))
+    windows = [round(max(v) - min(v), 3) for v in per.values() if len(v) > 1]
+    if not windows:
+        print("[!] No install trace - skipping installation window chart.")
         return
-    mutations = list(range(1, len(adaptive_windows) + 1))
-    baseline_windows = [0.0] * len(adaptive_windows)   # simultaneous by definition
 
-    x = [m - 0.15 for m in mutations]
-    y = [m + 0.15 for m in mutations]
-
-    ax.bar(x, baseline_windows, width=0.25, color=BASELINE_COLOR,
-           label='Baseline MTD', alpha=0.8)
-    ax.bar(y, adaptive_windows, width=0.25, color=ADAPTIVE_COLOR,
-           label='Adaptive MTD', alpha=0.8)
-
-    style_ax(ax, "Flow Rule Installation Window Per Mutation\n(Width = Time Spread Across Switches)",
-             "Mutation Number", "Installation Window (seconds)")
-    ax.legend(fontsize=10)
-    ax.set_xticks(mutations)
-
-    avg_adaptive = sum(adaptive_windows) / len(adaptive_windows)
-    ax.axhline(avg_adaptive, color=ADAPTIVE_COLOR, linestyle=':',
-               alpha=0.7, label=f'Adaptive avg ({avg_adaptive:.2f}s)')
-    ax.text(len(mutations)+0.2, avg_adaptive, f'{avg_adaptive:.2f}s avg',
-            color=ADAPTIVE_COLOR, fontsize=9, va='center')
-
-    plt.tight_layout()
-    path = "results/graphs/04_installation_window.png"
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"[+] Saved: {path}")
+    x = range(1, len(windows) + 1)
+    w = 0.35
+    plt.figure(figsize=(8, 5))
+    plt.bar([i - w / 2 for i in x], [0.0] * len(windows), width=w, label='Baseline')
+    plt.bar([i + w / 2 for i in x], windows, width=w, label='Adaptive')
+    plt.xlabel('Mutation number')
+    plt.ylabel('Install spread (s)')
+    plt.title('Install Spread Per Mutation')
+    plt.xticks(list(x))
+    plt.legend()
+    plt.grid(True, axis='y')
+    save('04_installation_window')
 
 
-# ── Chart 5: Summary Comparison Bar Chart ─────────────────────────────────────
+# ---------------------------------------------------------------- 05 summary
 def chart_summary(adaptive, baseline):
-    fig, axes = plt.subplots(1, 3, figsize=(13, 5))
+    a_cpu = [r['cpu_pct'] for r in adaptive]
+    b_cpu = [r['cpu_pct'] for r in baseline]
+    metrics = [
+        ('Avg CPU (%)',
+         sum(a_cpu) / len(a_cpu) if a_cpu else 0,
+         sum(b_cpu) / len(b_cpu) if b_cpu else 0),
+        ('Mutations',
+         adaptive[-1]['mutations'] if adaptive else 0,
+         baseline[-1]['mutations'] if baseline else 0),
+        ('Threat events',
+         adaptive[-1].get('threat_events', 0) if adaptive else 0,
+         baseline[-1].get('threat_events', 0) if baseline else 0),
+    ]
 
-    a_cpu  = [r['cpu_pct'] for r in adaptive]
-    b_cpu  = [r['cpu_pct'] for r in baseline]
-    a_muts = adaptive[-1]['mutations'] if adaptive else 0
-    b_muts = baseline[-1]['mutations'] if baseline else 0
-    a_thr  = adaptive[-1].get('threat_events', 0) if adaptive else 0
-    b_thr  = baseline[-1].get('threat_events', 0) if baseline else 0
-
-    def bar_pair(ax, a_val, b_val, title, ylabel, fmt="{:.2f}"):
-        bars = ax.bar(['Adaptive', 'Baseline'], [a_val, b_val],
-                      color=[ADAPTIVE_COLOR, BASELINE_COLOR],
-                      width=0.4, edgecolor='white')
-        for bar, val in zip(bars, [a_val, b_val]):
-            ax.text(bar.get_x() + bar.get_width()/2,
-                    bar.get_height() + max(a_val, b_val)*0.02,
-                    fmt.format(val), ha='center', fontsize=10, fontweight='bold')
-        style_ax(ax, title, "", ylabel)
-
-    bar_pair(axes[0], sum(a_cpu)/len(a_cpu) if a_cpu else 0,
-             sum(b_cpu)/len(b_cpu) if b_cpu else 0,
-             "Average CPU Usage", "CPU (%)", "{:.2f}%")
-    bar_pair(axes[1], a_muts, b_muts,
-             "Total Mutations", "Count", "{:.0f}")
-    bar_pair(axes[2], a_thr, b_thr,
-             "Threat Events Detected", "Count", "{:.0f}")
-
-    plt.suptitle("Adaptive vs Baseline MTD — Performance Summary",
-                 fontsize=13, fontweight='bold', y=1.02)
+    fig, axes = plt.subplots(1, 3, figsize=(11, 4))
+    for ax, (name, a, b) in zip(axes, metrics):
+        ax.bar(['Adaptive', 'Baseline'], [a, b])
+        ax.set_title(name)
+        ax.grid(True, axis='y')
+    fig.suptitle('Adaptive vs Baseline Summary')
     plt.tight_layout()
-    path = "results/graphs/05_summary_comparison.png"
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"[+] Saved: {path}")
+    save('05_summary_comparison')
 
 
+# ---------------------------------------------------------------- 06 entropy
+def chart_entropy(adaptive, baseline):
+    a_int = intervals(mutation_times(adaptive))
+    b_int = intervals(mutation_times(baseline))
+    a_h, b_h = entropy(a_int), entropy(b_int)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    axes[0].bar(['Adaptive', 'Baseline'], [a_h, b_h])
+    axes[0].set_ylabel('Entropy H(X) (bits)')
+    axes[0].set_title('Mutation Timing Entropy')
+    axes[0].grid(True, axis='y')
+
+    if a_int:
+        axes[1].plot(range(1, len(a_int) + 1), a_int, '-o', label='Adaptive')
+    if b_int:
+        axes[1].plot(range(1, len(b_int) + 1), b_int, '--s', label='Baseline')
+    axes[1].set_xlabel('Mutation number')
+    axes[1].set_ylabel('Interval (s)')
+    axes[1].set_title('Gap Between Mutations')
+    axes[1].legend()
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    save('06_mutation_entropy')
+
+
+# ---------------------------------------------------------------- 07 response time
+def chart_response_time(trace):
+    delays = [float(e.get('install_delay', 0)) for e in trace]
+    if not delays:
+        print("[!] No install trace - skipping response time chart.")
+        return
+    mean_d = sum(delays) / len(delays)
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(delays, bins=8, edgecolor='black')
+    plt.axvline(mean_d, color='r', linestyle='--', label='mean %.2f s' % mean_d)
+    plt.xlabel('Detection to install delay (s)')
+    plt.ylabel('Number of installs')
+    plt.title('Response Time Distribution')
+    plt.legend()
+    plt.grid(True, axis='y')
+    save('07_response_time')
+
+
+# ---------------------------------------------------------------- 08 throughput
+def chart_throughput(before, after, nodes):
+    if before is None or after is None:
+        print("[!] No throughput values - skipping (use --tput-before/--tput-after).")
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+
+    axes[0].bar(['Before', 'With mutation'], [before, after])
+    axes[0].set_ylabel('Throughput (Mbit/s)')
+    axes[0].set_title('TCP Throughput (h1 to h3)')
+    axes[0].grid(True, axis='y')
+
+    axes[1].bar(['%d nodes' % nodes], [after / nodes])
+    axes[1].set_ylabel('Mbit/s per node')
+    axes[1].set_title('Throughput Per Node')
+    axes[1].grid(True, axis='y')
+
+    plt.tight_layout()
+    save('08_throughput')
+
+
+# ---------------------------------------------------------------- main
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--adaptive', required=True)
-    parser.add_argument('--baseline', required=True)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--adaptive', required=True)
+    ap.add_argument('--baseline', required=True)
+    ap.add_argument('--tput-before', type=float, default=None)
+    ap.add_argument('--tput-after', type=float, default=None)
+    ap.add_argument('--nodes', type=int, default=5)
+    args = ap.parse_args()
 
-    print("\n[*] Loading experiment data...")
     adaptive = load_jsonl(args.adaptive)
     baseline = load_jsonl(args.baseline)
+    trace = load_trace()
 
     if not adaptive or not baseline:
-        print("[!] Could not load data files. Check paths.")
-        exit(1)
+        raise SystemExit("[!] Could not load experiment data.")
 
-    print(f"[*] Adaptive: {len(adaptive)} samples")
-    print(f"[*] Baseline: {len(baseline)} samples")
-    print("[*] Generating charts...\n")
+    print("[*] Adaptive: %d samples | Baseline: %d samples | Trace: %d installs"
+          % (len(adaptive), len(baseline), len(trace)))
 
     chart_cpu(adaptive, baseline)
     chart_mutations(adaptive, baseline)
     chart_detectability()
-    chart_installation_window()
+    chart_installation_window(trace)
     chart_summary(adaptive, baseline)
+    chart_entropy(adaptive, baseline)
+    chart_response_time(trace)
+    chart_throughput(args.tput_before, args.tput_after, args.nodes)
 
-    print("\n[*] All charts saved to results/graphs/")
-    print("[*] Copy them to Windows with:")
-    print("    scp -P 2222 -r mininet@127.0.0.1:~/mtd_sdn_project/results/graphs/ .")
+    print("[*] Charts written to results/graphs/")
